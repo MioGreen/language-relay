@@ -7,8 +7,6 @@ private enum AppIdentity {
     static let name = "Language Relay"
     static let bundleID = "dev.alex.layout-pilot"
     static let launchAgentLabel = "dev.alex.layout-pilot"
-    static let usID = "com.apple.keylayout.US"
-    static let russianPCID = "com.apple.keylayout.RussianWin"
     static let hammerspoonBundleID = "org.hammerspoon.Hammerspoon"
     static let bridgeLoadLine = "dofile(os.getenv(\"HOME\") .. \"/.config/language-relay/hammerspoon.lua\")"
     static let homeDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -18,6 +16,11 @@ private enum AppIdentity {
     static let hammerspoonInitPath = homeDirectory
         .appendingPathComponent(".hammerspoon/init.lua")
         .path
+    /// Fallback pair used when no `sourceLayoutID` / `targetLayoutID` are stored,
+    /// or when the stored pair cannot be resolved. Keeps existing installs
+    /// unchanged (they never wrote those keys, so they always hit this pair).
+    static let defaultSourceID = "com.apple.keylayout.US"
+    static let defaultTargetID = "com.apple.keylayout.RussianWin"
     static let hammerspoonBridgeMarker = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/language-relay/hammerspoon-bridge")
         .path
@@ -121,22 +124,35 @@ private enum InputSources {
         return unsafeBitCast(pointer, to: CFString.self) as String
     }
 
-    static func source(withID id: String, includeAllInstalled: Bool = false) -> TISInputSource? {
+    /// Any installed source, enabled or not (mirrors the historical lookup used
+    /// to build the default pair, so absent-settings installs see no behavior
+    /// change and no new dependency on the source being in the active list).
+    static func source(withID id: String) -> TISInputSource? {
         let filter = [kTISPropertyInputSourceID as String: id] as CFDictionary
-        guard let list = TISCreateInputSourceList(filter, includeAllInstalled)?.takeRetainedValue() else {
+        guard let list = TISCreateInputSourceList(filter, true)?.takeRetainedValue() else {
             return nil
         }
         return (list as NSArray).firstObject as! TISInputSource?
     }
 
-    static func isEnabled(_ id: String) -> Bool {
-        source(withID: id) != nil
+    /// Only a source the user currently has enabled (in their active input
+    /// menu) resolves here — used to validate a *stored* configured pair,
+    /// where "not enabled" must be treated as a distinct failure from
+    /// "not installed" per the settings-validation contract.
+    static func enabledSource(withID id: String) -> TISInputSource? {
+        let filter = [kTISPropertyInputSourceID as String: id] as CFDictionary
+        guard let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() else { return nil }
+        return (list as NSArray).firstObject as! TISInputSource?
+    }
+
+    static func isEnabled(id: String) -> Bool {
+        enabledSource(withID: id) != nil
     }
 
     @discardableResult
     static func enable(_ id: String) -> Bool {
-        if isEnabled(id) { return true }
-        guard let source = source(withID: id, includeAllInstalled: true) else { return false }
+        if isEnabled(id: id) { return true }
+        guard let source = source(withID: id) else { return false }
         return TISEnableInputSource(source) == noErr
     }
 
@@ -152,11 +168,35 @@ private enum InputSources {
     }
 
     @discardableResult
-    static func toggle() -> Bool {
-        let target = currentID() == AppIdentity.usID ? AppIdentity.russianPCID : AppIdentity.usID
-        return select(target)
+    static func toggle(source sourceID: String, target targetID: String) -> Bool {
+        let next = currentID() == targetID ? sourceID : targetID
+        return select(next)
     }
 
+    /// Currently enabled keyboard layouts eligible for the pair picker:
+    /// excludes palette entries (`kTISCategoryPaletteInputSource`) and IME
+    /// input modes (e.g. `com.apple.CharacterPaletteIM`, Pinyin, Kotoeri) by
+    /// requiring the same Unicode key layout data the conversion engine
+    /// itself needs — those categories never carry it. Never enables,
+    /// disables, or reorders anything; read-only enumeration.
+    static func enabledKeyboardLayouts() -> [(id: String, name: String)] {
+        let filter = [kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource] as CFDictionary
+        guard let list = TISCreateInputSourceList(filter, false)?.takeRetainedValue() as? [TISInputSource] else {
+            return []
+        }
+        return list.compactMap { source in
+            guard let id = stringProperty(source, kTISPropertyInputSourceID) else { return nil }
+            guard TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) != nil else { return nil }
+            let name = stringProperty(source, kTISPropertyLocalizedName) ?? id
+            return (id, name)
+        }
+        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Structural build only (installed + has key layout data). Used for the
+    /// default pair and for exercising the engine against an arbitrary
+    /// deterministic pair without requiring it to be in the user's active
+    /// input menu on this machine.
     static func layoutMap(id: String) -> LayoutMap? {
         guard let source = source(withID: id),
               let dataPointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
@@ -192,6 +232,15 @@ private enum InputSources {
             strokeToCharacter: strokeToCharacter,
             characterToStroke: characterToStroke
         )
+    }
+
+    /// Validation build for a *stored* pair identifier: missing, not
+    /// enabled, and no-Unicode-data are each distinct failures collapsed
+    /// into one `nil` here; the caller (`LayoutPairResolver`) re-derives
+    /// which one it was for the doctor blocker message.
+    static func enabledLayoutMap(id: String) -> LayoutMap? {
+        guard isEnabled(id: id) else { return nil }
+        return layoutMap(id: id)
     }
 
     private static func translate(
@@ -335,8 +384,11 @@ private struct InstallationHealth {
     let hammerspoonInstalled: Bool
     let bridgeInstalled: Bool
     let bridgeLoaded: Bool
-    let usInputSourceEnabled: Bool
-    let russianPCInputSourceEnabled: Bool
+    let sourceLayoutID: String
+    let targetLayoutID: String
+    let sourceEnabled: Bool
+    let targetEnabled: Bool
+    let pairBlocker: String?
     let accessibilityTrusted: Bool
     let bridgeActive: Bool
     let hammerspoonAccessibilityTrusted: Bool?
@@ -347,14 +399,22 @@ private struct InstallationHealth {
 
     static func collect() -> InstallationHealth {
         let bridgeActive = FileManager.default.fileExists(atPath: AppIdentity.hammerspoonBridgeMarker)
+        let resolved = LayoutPairResolver.resolve(defaults: .standard)
+        let pairSourceID = resolved?.sourceID ?? AppIdentity.defaultSourceID
+        let pairTargetID = resolved?.targetID ?? AppIdentity.defaultTargetID
+        let pairBlocker = resolved?.blocker
+            ?? "no usable layout pair could be resolved from settings or defaults"
         return InstallationHealth(
             hammerspoonInstalled: NSWorkspace.shared.urlForApplication(
                 withBundleIdentifier: AppIdentity.hammerspoonBundleID
             ) != nil,
             bridgeInstalled: BridgeConfiguration.isInstalled,
             bridgeLoaded: BridgeConfiguration.isLoaded,
-            usInputSourceEnabled: InputSources.isEnabled(AppIdentity.usID),
-            russianPCInputSourceEnabled: InputSources.isEnabled(AppIdentity.russianPCID),
+            sourceLayoutID: pairSourceID,
+            targetLayoutID: pairTargetID,
+            sourceEnabled: InputSources.isEnabled(id: pairSourceID),
+            targetEnabled: InputSources.isEnabled(id: pairTargetID),
+            pairBlocker: resolved == nil ? pairBlocker : resolved?.blocker,
             accessibilityTrusted: AXIsProcessTrusted(),
             bridgeActive: bridgeActive,
             hammerspoonAccessibilityTrusted: bridgeActive ? HammerspoonCLI.accessibilityTrusted : nil,
@@ -390,18 +450,25 @@ private struct InstallationHealth {
                 fix: "Run: language-relay setup, then reload Hammerspoon."
             ))
         }
-        if !usInputSourceEnabled {
+        if !sourceEnabled {
             result.append(DoctorBlocker(
-                code: "input-source-us-not-enabled",
-                message: "The U.S. input source is not enabled.",
-                fix: "Run: language-relay setup"
+                code: "input-source-not-enabled",
+                message: "The configured source layout \(sourceLayoutID) is not enabled.",
+                fix: "Run: language-relay setup, or pick another pair in the Language Relay panel."
             ))
         }
-        if !russianPCInputSourceEnabled {
+        if !targetEnabled {
             result.append(DoctorBlocker(
-                code: "input-source-russian-pc-not-enabled",
-                message: "The Russian – PC input source is not enabled.",
-                fix: "Run: language-relay setup"
+                code: "target-input-source-not-enabled",
+                message: "The configured target layout \(targetLayoutID) is not enabled.",
+                fix: "Run: language-relay setup, or pick another pair in the Language Relay panel."
+            ))
+        }
+        if let pairBlocker {
+            result.append(DoctorBlocker(
+                code: "layout-pair-fell-back",
+                message: pairBlocker,
+                fix: "Re-pick the pair in the Language Relay panel, or enable it in System Settings > Keyboard > Input Sources."
             ))
         }
         // While the bridge owns the gestures, Hammerspoon is the process that needs
@@ -454,9 +521,11 @@ private struct InstallationHealth {
             "bridgeInstalled": bridgeInstalled,
             "bridgeActive": bridgeActive,
             "bridgeLoaded": bridgeLoaded,
+            "sourceLayoutID": sourceLayoutID,
+            "targetLayoutID": targetLayoutID,
             "inputSourcesEnabled": [
-                "us": usInputSourceEnabled,
-                "russianPC": russianPCInputSourceEnabled,
+                "source": sourceEnabled,
+                "target": targetEnabled,
             ],
             "agentLoaded": agentLoaded,
             "appRunning": appRunning,
@@ -497,8 +566,9 @@ private struct InstallationHealth {
 
 private enum Setup {
     static func run() -> Int32 {
-        _ = InputSources.enable(AppIdentity.usID)
-        _ = InputSources.enable(AppIdentity.russianPCID)
+        let pair = LayoutPairResolver.resolve(defaults: .standard)
+        _ = InputSources.enable(pair?.sourceID ?? AppIdentity.defaultSourceID)
+        _ = InputSources.enable(pair?.targetID ?? AppIdentity.defaultTargetID)
         _ = BridgeConfiguration.addLoadLineIfNeeded()
 
         let bridgeActive = FileManager.default.fileExists(atPath: AppIdentity.hammerspoonBridgeMarker)
@@ -529,8 +599,8 @@ private enum Setup {
             (health.hammerspoonInstalled, "Hammerspoon is installed", "hammerspoon-not-installed"),
             (health.bridgeInstalled, "Language Relay bridge is installed", "bridge-not-installed"),
             (health.bridgeLoaded, "Hammerspoon loads the Language Relay bridge", "bridge-not-loaded"),
-            (health.usInputSourceEnabled, "U.S. input source is enabled", "input-source-us-not-enabled"),
-            (health.russianPCInputSourceEnabled, "Russian – PC input source is enabled", "input-source-russian-pc-not-enabled"),
+            (health.sourceEnabled, "source layout \(health.sourceLayoutID) is enabled", "input-source-not-enabled"),
+            (health.targetEnabled, "target layout \(health.targetLayoutID) is enabled", "target-input-source-not-enabled"),
         ]
         if health.bridgeActive {
             checks.append((
@@ -565,25 +635,116 @@ private enum Setup {
     }
 }
 
-private final class LayoutConversionCore {
-    let us: LayoutMap
-    let russianPC: LayoutMap
+/// Resolves the configured layout pair from `UserDefaults`, validating a
+/// stored pair and falling back to `AppIdentity`'s default pair (with a
+/// `blocker` explanation) instead of ever failing outright — only the
+/// default pair itself being unresolvable is left as a hard failure, which
+/// mirrors today's exit-on-missing-defaults behavior.
+private enum LayoutPairResolver {
+    struct Resolution {
+        let source: LayoutMap
+        let target: LayoutMap
+        let sourceID: String
+        let targetID: String
+        let blocker: String?
+    }
 
-    init?() {
-        guard let us = InputSources.layoutMap(id: AppIdentity.usID),
-              let russianPC = InputSources.layoutMap(id: AppIdentity.russianPCID)
+    static func resolve(defaults: UserDefaults) -> Resolution? {
+        let storedSource = defaults.string(forKey: "sourceLayoutID")
+        let storedTarget = defaults.string(forKey: "targetLayoutID")
+
+        // Nothing stored at all: existing installs keep today's pair, silently.
+        guard storedSource != nil || storedTarget != nil else {
+            return defaultResolution()
+        }
+
+        let sourceID = storedSource ?? AppIdentity.defaultSourceID
+        let targetID = storedTarget ?? AppIdentity.defaultTargetID
+
+        if let source = InputSources.enabledLayoutMap(id: sourceID),
+           let target = InputSources.enabledLayoutMap(id: targetID) {
+            return Resolution(source: source, target: target, sourceID: sourceID, targetID: targetID, blocker: nil)
+        }
+
+        guard let fallback = defaultResolution() else { return nil }
+        return Resolution(
+            source: fallback.source,
+            target: fallback.target,
+            sourceID: fallback.sourceID,
+            targetID: fallback.targetID,
+            blocker: blockerMessage(sourceID: sourceID, targetID: targetID)
+        )
+    }
+
+    private static func defaultResolution() -> Resolution? {
+        guard let source = InputSources.layoutMap(id: AppIdentity.defaultSourceID),
+              let target = InputSources.layoutMap(id: AppIdentity.defaultTargetID)
         else { return nil }
-        self.us = us
-        self.russianPC = russianPC
+        return Resolution(
+            source: source,
+            target: target,
+            sourceID: AppIdentity.defaultSourceID,
+            targetID: AppIdentity.defaultTargetID,
+            blocker: nil
+        )
+    }
+
+    private static func blockerMessage(sourceID: String, targetID: String) -> String {
+        var reasons: [String] = []
+        if let reason = failureReason(id: sourceID) { reasons.append("source \(sourceID) \(reason)") }
+        if let reason = failureReason(id: targetID) { reasons.append("target \(targetID) \(reason)") }
+        let detail = reasons.isEmpty ? "the configured layout pair is unavailable" : reasons.joined(separator: "; ")
+        return "\(detail). Using \(AppIdentity.defaultSourceID) ⇄ \(AppIdentity.defaultTargetID) instead. " +
+            "Re-pick the pair in the Language Relay panel, or enable it in " +
+            "System Settings → Keyboard → Input Sources."
+    }
+
+    private static func failureReason(id: String) -> String? {
+        guard InputSources.source(withID: id) != nil else { return "is not installed" }
+        guard InputSources.isEnabled(id: id) else { return "is not enabled" }
+        guard InputSources.layoutMap(id: id) != nil else { return "has no usable keyboard layout data" }
+        return nil
+    }
+}
+
+private final class LayoutConversionCore {
+    let source: LayoutMap
+    let target: LayoutMap
+    /// Non-nil only when a stored pair failed validation and the default
+    /// pair was substituted; surfaced verbatim by `--doctor-json`.
+    let blocker: String?
+
+    /// Production entry point: resolves the pair from `UserDefaults`,
+    /// validating a stored pair against "installed", "enabled", and "has
+    /// Unicode key layout data" and falling back to the default pair
+    /// (with `blocker` set) rather than failing.
+    init?(defaults: UserDefaults) {
+        guard let resolution = LayoutPairResolver.resolve(defaults: defaults) else { return nil }
+        self.source = resolution.source
+        self.target = resolution.target
+        self.blocker = resolution.blocker
+    }
+
+    /// Structural entry point used by tests to exercise the conversion
+    /// engine against an arbitrary deterministic pair (e.g. Apple's
+    /// standard `Russian` layout) without requiring it to be enabled in the
+    /// active input menu on the machine running the test.
+    init?(sourceID: String, targetID: String) {
+        guard let source = InputSources.layoutMap(id: sourceID),
+              let target = InputSources.layoutMap(id: targetID)
+        else { return nil }
+        self.source = source
+        self.target = target
+        self.blocker = nil
     }
 
     func convertAll(
         _ text: String,
         capitalization: CapitalizationMode = .preserve
     ) -> Conversion? {
-        guard let source = detectSource(for: text) else { return nil }
-        let target = source.id == us.id ? russianPC : us
-        guard let converted = convert(text, from: source, to: target) else { return nil }
+        guard let detectedSource = detectSource(for: text) else { return nil }
+        let destination = detectedSource.id == source.id ? target : source
+        guard let converted = convert(text, from: detectedSource, to: destination) else { return nil }
         return Conversion(
             text: capitalization.apply(to: converted.text),
             sourceID: converted.sourceID,
@@ -614,22 +775,22 @@ private final class LayoutConversionCore {
 
         let keep = tokens[..<startIndex].map(\.text).joined()
         let phrase = tokens[startIndex...].map(\.text).joined()
-        let target = phraseSource.id == us.id ? russianPC : us
-        guard let converted = convert(phrase, from: phraseSource, to: target) else { return nil }
+        let destination = phraseSource.id == source.id ? target : source
+        guard let converted = convert(phrase, from: phraseSource, to: destination) else { return nil }
         return Conversion(
             text: keep + capitalization.apply(to: converted.text),
             sourceID: phraseSource.id,
-            targetID: target.id
+            targetID: destination.id
         )
     }
 
-    private func convert(_ text: String, from source: LayoutMap, to target: LayoutMap) -> Conversion? {
+    private func convert(_ text: String, from origin: LayoutMap, to destination: LayoutMap) -> Conversion? {
         var result = ""
         var mappedLetters = 0
 
         for character in text {
-            if let stroke = source.characterToStroke[character],
-               let targetCharacter = target.strokeToCharacter[stroke] {
+            if let stroke = origin.characterToStroke[character],
+               let targetCharacter = destination.strokeToCharacter[stroke] {
                 result.append(targetCharacter)
                 if character.isLetter { mappedLetters += 1 }
             } else {
@@ -638,16 +799,16 @@ private final class LayoutConversionCore {
         }
 
         guard mappedLetters > 0, result != text else { return nil }
-        return Conversion(text: result, sourceID: source.id, targetID: target.id)
+        return Conversion(text: result, sourceID: origin.id, targetID: destination.id)
     }
 
     private func detectSource(for text: String) -> LayoutMap? {
         let letters = text.filter(\.isLetter)
         guard !letters.isEmpty else { return nil }
-        let usScore = letters.reduce(0) { $0 + (us.characterToStroke[$1] == nil ? 0 : 1) }
-        let russianScore = letters.reduce(0) { $0 + (russianPC.characterToStroke[$1] == nil ? 0 : 1) }
-        guard usScore != russianScore else { return nil }
-        return usScore > russianScore ? us : russianPC
+        let sourceScore = letters.reduce(0) { $0 + (source.characterToStroke[$1] == nil ? 0 : 1) }
+        let targetScore = letters.reduce(0) { $0 + (target.characterToStroke[$1] == nil ? 0 : 1) }
+        guard sourceScore != targetScore else { return nil }
+        return sourceScore > targetScore ? source : target
     }
 
     private struct Token {
@@ -708,7 +869,9 @@ private struct PasteboardSnapshot {
 
 @MainActor
 private final class TextFixer {
-    private let core: LayoutConversionCore
+    /// `var` so the app delegate can swap in a rebuilt core after the user
+    /// picks a new layout pair, without tearing down the whole fixer.
+    var core: LayoutConversionCore
 
     init(core: LayoutConversionCore) {
         self.core = core
@@ -911,7 +1074,7 @@ private final class DoubleShiftMonitor {
 
 private enum LayoutPilotPanelMetrics {
     static let width: CGFloat = 420
-    static let height: CGFloat = 568
+    static let height: CGFloat = 650
     static let contentWidth: CGFloat = 388
 }
 
@@ -1170,7 +1333,9 @@ private enum LayoutPilotStatusGlyph {
 
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
-    private let core: LayoutConversionCore
+    /// `var`: rebuilt in place when the user picks a new layout pair from
+    /// the panel, so the running app never needs a restart to pick it up.
+    private var core: LayoutConversionCore
     private let fixer: TextFixer
     private let defaults = UserDefaults.standard
     private var statusItem: NSStatusItem!
@@ -1182,6 +1347,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     private var previewSound: NSSound?
     private var lastObservedInputID: String?
     private var presentationNotice: String?
+    private var layoutMenuSleeves: [ClosureSleeve] = []
 
     private var mode: FixMode {
         get { FixMode(rawValue: defaults.string(forKey: "fixMode") ?? "phrase") ?? .phrase }
@@ -1308,8 +1474,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 
     private func updateStatusButton() {
         let currentID = InputSources.currentID()
-        let russian = currentID == AppIdentity.russianPCID
-        statusItem.button?.image = LayoutPilotStatusGlyph.make(russianActive: russian)
+        let targetActive = currentID == core.target.id
+        statusItem.button?.image = LayoutPilotStatusGlyph.make(russianActive: targetActive)
         statusItem.button?.toolTip = "Language Relay · ⇧⇧ or clean ⌥ repairs the last wrong-layout text"
         if let previous = lastObservedInputID,
            previous != currentID,
@@ -1476,9 +1642,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         layoutRow.alignment = .centerY
         layoutRow.spacing = 6
         let current = InputSources.currentID()
-        let currentLabel = current == AppIdentity.russianPCID
-            ? "a ⇄ [ру] · russian – pc active"
-            : "[a] ⇄ ру · u.s. active"
+        let sourceLabel = core.source.name.lowercased()
+        let targetLabel = core.target.name.lowercased()
+        let currentLabel = current == core.target.id
+            ? "\(sourceLabel) ⇄ [\(targetLabel)] · active"
+            : "[\(sourceLabel)] ⇄ \(targetLabel) · active"
         let state = stateReadout(currentLabel, width: 340, height: 42)
         let toggle = squareButton("⇄", action: #selector(toggleLayout), width: 42, height: 42)
         toggle.toolTip = "switch input source"
@@ -1486,7 +1654,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         layoutRow.addArrangedSubview(toggle)
         root.addArrangedSubview(layoutRow)
 
-        root.addArrangedSubview(sectionHeader("02 · correction scope", width: LayoutPilotPanelMetrics.contentWidth))
+        root.addArrangedSubview(sectionHeader("02 · layout pair · pick from enabled sources", width: LayoutPilotPanelMetrics.contentWidth))
+        let pairRow = NSStackView()
+        pairRow.orientation = .horizontal
+        pairRow.spacing = 6
+        let sourcePick = squareButton("src · \(sourceLabel)", action: #selector(chooseSourceLayout(_:)), width: 191, height: 34)
+        sourcePick.toolTip = "pick the source keyboard layout from currently enabled input sources"
+        let targetPick = squareButton("dst · \(targetLabel)", action: #selector(chooseTargetLayout(_:)), width: 191, height: 34)
+        targetPick.toolTip = "pick the target keyboard layout from currently enabled input sources"
+        pairRow.addArrangedSubview(sourcePick)
+        pairRow.addArrangedSubview(targetPick)
+        root.addArrangedSubview(pairRow)
+
+        // Fixed-height slot regardless of blocker presence, so the panel's
+        // layout does not shift based on runtime settings validity.
+        let blockerText = core.blocker ?? "layout pair resolved from settings"
+        let blockerLabel = label(
+            blockerText,
+            size: 7.6,
+            weight: .semibold,
+            color: core.blocker == nil ? UI.muted : UI.red,
+            height: 26
+        )
+        blockerLabel.toolTip = blockerText
+        blockerLabel.maximumNumberOfLines = 2
+        root.addArrangedSubview(blockerLabel)
+
+        root.addArrangedSubview(sectionHeader("03 · correction scope", width: LayoutPilotPanelMetrics.contentWidth))
         let modeRow = NSStackView()
         modeRow.orientation = .horizontal
         modeRow.spacing = 6
@@ -1512,7 +1706,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         modeRow.addArrangedSubview(word)
         root.addArrangedSubview(modeRow)
 
-        root.addArrangedSubview(sectionHeader("03 · letter case · aA keep · Aa sentence · AA upper · aa lower", width: LayoutPilotPanelMetrics.contentWidth))
+        root.addArrangedSubview(sectionHeader("04 · letter case · aA keep · Aa sentence · AA upper · aa lower", width: LayoutPilotPanelMetrics.contentWidth))
         let capitalizationRow = NSStackView()
         capitalizationRow.orientation = .horizontal
         capitalizationRow.spacing = 6
@@ -1542,7 +1736,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         capitalizationRow.addArrangedSubview(lowercase)
         root.addArrangedSubview(capitalizationRow)
 
-        root.addArrangedSubview(sectionHeader("04 · triggers · standalone modifier taps only", width: LayoutPilotPanelMetrics.contentWidth))
+        root.addArrangedSubview(sectionHeader("05 · triggers · standalone modifier taps only", width: LayoutPilotPanelMetrics.contentWidth))
         let triggerRow = NSStackView()
         triggerRow.orientation = .horizontal
         triggerRow.spacing = 6
@@ -1554,7 +1748,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
         triggerRow.addArrangedSubview(option)
         root.addArrangedSubview(triggerRow)
 
-        root.addArrangedSubview(sectionHeader("05 · feedback · micro-sfx", width: LayoutPilotPanelMetrics.contentWidth))
+        root.addArrangedSubview(sectionHeader("06 · feedback · micro-sfx", width: LayoutPilotPanelMetrics.contentWidth))
         let soundRow = NSStackView()
         soundRow.orientation = .horizontal
         soundRow.spacing = 6
@@ -1787,7 +1981,64 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
     }
 
     @objc private func toggleLayout() {
-        _ = InputSources.toggle()
+        _ = InputSources.toggle(source: core.source.id, target: core.target.id)
+        updateStatusButton()
+        rebuildPopoverContent()
+    }
+
+    @objc private func chooseSourceLayout(_ sender: NSButton) {
+        presentLayoutMenu(current: core.source.id, for: sender) { [weak self] id in
+            self?.setLayoutPair(sourceID: id, targetID: nil)
+        }
+    }
+
+    @objc private func chooseTargetLayout(_ sender: NSButton) {
+        presentLayoutMenu(current: core.target.id, for: sender) { [weak self] id in
+            self?.setLayoutPair(sourceID: nil, targetID: id)
+        }
+    }
+
+    private func presentLayoutMenu(current: String, for sender: NSButton, onSelect: @escaping (String) -> Void) {
+        layoutMenuSleeves.removeAll()
+        let menu = NSMenu()
+        let layouts = InputSources.enabledKeyboardLayouts()
+        if layouts.isEmpty {
+            let empty = NSMenuItem(title: "no enabled keyboard layouts found", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        for layout in layouts {
+            let item = NSMenuItem(title: layout.name, action: #selector(ClosureSleeve.invoke(_:)), keyEquivalent: "")
+            let sleeve = ClosureSleeve { onSelect(layout.id) }
+            layoutMenuSleeves.append(sleeve)
+            item.target = sleeve
+            item.state = layout.id == current ? .on : .off
+            menu.addItem(item)
+        }
+        _ = menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    /// Writes the picked identifier(s) as strings under `dev.alex.layout-pilot`
+    /// and rebuilds the running core in place. If the new pick collides with
+    /// the other half of the pair, swaps them instead of collapsing to a
+    /// degenerate single-layout "pair".
+    private func setLayoutPair(sourceID: String?, targetID: String?) {
+        var nextSource = sourceID ?? core.source.id
+        var nextTarget = targetID ?? core.target.id
+        if nextSource == nextTarget {
+            if let sourceID { nextTarget = core.source.id; nextSource = sourceID }
+            else if let targetID { nextSource = core.target.id; nextTarget = targetID }
+        }
+        defaults.set(nextSource, forKey: "sourceLayoutID")
+        defaults.set(nextTarget, forKey: "targetLayoutID")
+        reloadLayoutPair()
+    }
+
+    private func reloadLayoutPair() {
+        guard let rebuilt = LayoutConversionCore(defaults: defaults) else { return }
+        core = rebuilt
+        fixer.core = rebuilt
+        reloadBridgeSettings()
         updateStatusButton()
         rebuildPopoverContent()
     }
@@ -1869,8 +2120,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDeleg
 }
 
 private enum SelfTest {
-    static func run(core: LayoutConversionCore) -> Int32 {
+    static func run(core configuredCore: LayoutConversionCore) -> Int32 {
         var failures: [String] = []
+
+        // The fixed expectations below encode punctuation positions, which differ
+        // between layouts: `&` maps to `?` in Russian – PC and to `.` in Apple's
+        // standard Russian. Assert them against the default pair rather than the
+        // one the person configured, so `make test` does not depend on settings.
+        let core = LayoutConversionCore(
+            sourceID: AppIdentity.defaultSourceID,
+            targetID: AppIdentity.defaultTargetID
+        ) ?? configuredCore
 
         func expect(_ input: String, _ expected: String) {
             let actual = core.convertAll(input)?.text
@@ -1946,6 +2206,71 @@ private enum SelfTest {
         let healthSeconds = Date().timeIntervalSince(healthStart)
         if healthSeconds > 5 {
             failures.append("health collection took \(String(format: "%.1f", healthSeconds))s")
+        // Configurable pair, check 1: the engine generalizes to a deterministic
+        // pair sourced the same way settings would supply it (plain identifier
+        // strings), including Apple's standard `Russian` layout rather than
+        // only the PC-remapped `RussianWin` this app shipped with. Built via
+        // the structural (installed-only) path, since `com.apple.keylayout.Russian`
+        // ships with every macOS install but is not necessarily in anyone's
+        // active input menu — this must not require enabling it on the
+        // machine running `make test`.
+        if let applePair = LayoutConversionCore(sourceID: "com.apple.keylayout.US", targetID: "com.apple.keylayout.Russian") {
+            let seed = "privet mir"
+            if let converted = applePair.convertAll(seed)?.text,
+               converted != seed,
+               let roundTrip = applePair.convertAll(converted)?.text,
+               roundTrip == seed {
+                // conversion and round trip both hold for the Apple standard Russian pair
+            } else {
+                failures.append("apple standard russian pair: conversion/round-trip failed")
+            }
+        } else {
+            failures.append("apple standard russian pair unavailable (com.apple.keylayout.Russian has no Unicode key layout data on this system)")
+        }
+
+        // Configurable pair, check 2: an unresolvable *stored* identifier
+        // must fall back to the default pair with a blocker explanation
+        // rather than making the whole app exit. Uses an isolated defaults
+        // suite (cleaned up below) so this never touches real app settings.
+        let selfTestSuite = "dev.alex.layout-pilot.self-test"
+        if let fallbackDefaults = UserDefaults(suiteName: selfTestSuite) {
+            fallbackDefaults.removePersistentDomain(forName: selfTestSuite)
+            fallbackDefaults.set("com.apple.keylayout.LanguageRelaySelfTestBogus", forKey: "sourceLayoutID")
+            if let resolved = LayoutConversionCore(defaults: fallbackDefaults) {
+                if resolved.blocker == nil {
+                    failures.append("settings fallback: expected a blocker for an unresolvable stored identifier")
+                }
+                if resolved.source.id != AppIdentity.defaultSourceID || resolved.target.id != AppIdentity.defaultTargetID {
+                    failures.append("settings fallback: expected the default pair, got \(resolved.source.id) / \(resolved.target.id)")
+                }
+            } else {
+                failures.append("settings fallback: resolver exited instead of falling back to the default pair")
+            }
+            fallbackDefaults.removePersistentDomain(forName: selfTestSuite)
+        } else {
+            failures.append("settings fallback: could not create an isolated defaults suite for the test")
+        }
+
+        // Configurable pair, check 3: absent settings (the common case for
+        // every existing install) must keep today's pair with no blocker.
+        let absentSuite = "dev.alex.layout-pilot.self-test-absent"
+        if let absentDefaults = UserDefaults(suiteName: absentSuite) {
+            absentDefaults.removePersistentDomain(forName: absentSuite)
+            if let resolved = LayoutConversionCore(defaults: absentDefaults) {
+                if resolved.blocker != nil {
+                    failures.append("absent settings: unexpected blocker \(resolved.blocker ?? "")")
+                }
+                if resolved.source.id != AppIdentity.defaultSourceID || resolved.target.id != AppIdentity.defaultTargetID {
+                    failures.append("absent settings: expected the default pair, got \(resolved.source.id) / \(resolved.target.id)")
+                }
+            } else {
+                failures.append("absent settings: resolver returned nil")
+            }
+            absentDefaults.removePersistentDomain(forName: absentSuite)
+        } else {
+            failures.append("absent settings: could not create an isolated defaults suite for the test")
+        }
+
         }
 
         return finish(failures)
@@ -1956,7 +2281,7 @@ private enum SelfTest {
             for failure in failures { fputs("FAIL: \(failure)\n", stderr) }
             return 1
         }
-        print("PASS: 21 layout, setup, and presentation tests")
+        print("PASS: 24 layout, pair, setup, and presentation tests")
         return 0
     }
 }
@@ -1973,6 +2298,13 @@ private struct LayoutPilotMain {
         if arguments.contains("--setup") {
             exit(Setup.run())
         }
+        // Пара нужна ветками ниже, до построения ядра.
+        let configuredPair: (source: String, target: String) = {
+            guard let r = LayoutPairResolver.resolve(defaults: .standard) else {
+                return (AppIdentity.defaultSourceID, AppIdentity.defaultTargetID)
+            }
+            return (r.sourceID, r.targetID)
+        }()
         if arguments.contains("--status") {
             print("input=\(InputSources.currentID() ?? "unknown")")
             print("accessibility=\(AXIsProcessTrusted())")
@@ -1990,7 +2322,7 @@ private struct LayoutPilotMain {
                 "inputSourceID": current,
                 "accessibilityTrusted": AXIsProcessTrusted(),
                 "carambaRunning": caramba,
-                "ready": current == AppIdentity.usID || current == AppIdentity.russianPCID,
+                "ready": current == configuredPair.source || current == configuredPair.target,
             ])
             exit(0)
         }
@@ -1999,7 +2331,7 @@ private struct LayoutPilotMain {
                 "schemaVersion": 1,
                 "app": AppIdentity.name,
                 "version": "2.3.1",
-                "pair": [AppIdentity.usID, AppIdentity.russianPCID],
+                "pair": [configuredPair.source, configuredPair.target],
                 "scopes": ["word", "phrase"],
                 "capitalization": ["preserve", "sentence", "uppercase", "lowercase"],
                 "presentation": Presentation.allCases.map(\.rawValue),
@@ -2009,8 +2341,14 @@ private struct LayoutPilotMain {
             ])
             exit(0)
         }
-        guard let core = LayoutConversionCore() else {
-            fputs("Language Relay: U.S. and Russian – PC input sources are required.\n", stderr)
+        let defaults = UserDefaults.standard
+        guard let core = LayoutConversionCore(defaults: defaults) else {
+            fputs(
+                "Language Relay: no usable keyboard layout pair. " +
+                "Enable \(AppIdentity.defaultSourceID) and \(AppIdentity.defaultTargetID), " +
+                "or configure a pair in the Language Relay panel.\n",
+                stderr
+            )
             exit(2)
         }
 
@@ -2029,7 +2367,7 @@ private struct LayoutPilotMain {
                 fputs("FAIL: background UI self-test\n", stderr)
                 exit(6)
             }
-            print("PASS: background UI self-test; panel=420x568; glyph=54x18; window=none")
+            print("PASS: background UI self-test; panel=420x650; glyph=54x18; window=none")
             exit(0)
         }
         if let index = arguments.firstIndex(of: "--render-ui"), arguments.indices.contains(index + 1) {
@@ -2044,7 +2382,7 @@ private struct LayoutPilotMain {
         }
         if let index = arguments.firstIndex(of: "--convert-json"), arguments.indices.contains(index + 1) {
             guard let conversion = core.convertAll(arguments[index + 1], capitalization: capitalization) else { exit(3) }
-            writeJSON(conversion)
+            writeJSON(conversion, core: core)
             exit(0)
         }
         if let index = arguments.firstIndex(of: "--convert-phrase-json"), arguments.indices.contains(index + 1) {
@@ -2052,11 +2390,16 @@ private struct LayoutPilotMain {
                 arguments[index + 1],
                 capitalization: capitalization
             ) else { exit(3) }
-            writeJSON(conversion)
+            writeJSON(conversion, core: core)
             exit(0)
         }
         if arguments.contains("--switch") {
-            exit(InputSources.toggle() ? 0 : 4)
+            exit(InputSources.toggle(source: core.source.id, target: core.target.id) ? 0 : 4)
+        }
+        if arguments.contains("--enable-pair") {
+            let sourceEnabled = enableInputSource(core.source.id)
+            let targetEnabled = enableInputSource(core.target.id)
+            exit(sourceEnabled && targetEnabled ? 0 : 4)
         }
 
         let app = NSApplication.shared
@@ -2065,8 +2408,31 @@ private struct LayoutPilotMain {
         app.run()
     }
 
-    private static func writeJSON(_ conversion: Conversion) {
-        let payload = ["text": conversion.text, "sourceID": conversion.sourceID, "targetID": conversion.targetID]
+    /// Backing `language-relay setup`: enables the configured pair as active
+    /// macOS input sources (`TISEnableInputSource`), driven by whatever pair
+    /// `core` resolved to — never a hard-coded U.S./Russian – PC pair.
+    /// Enabling is a one-time explicit setup action the user runs, not
+    /// something the app does implicitly on launch.
+    private static func enableInputSource(_ id: String) -> Bool {
+        guard let source = InputSources.source(withID: id) else { return false }
+        if InputSources.isEnabled(id: id) { return true }
+        return TISEnableInputSource(source) == noErr
+    }
+
+    /// Includes `sourceName`/`targetName` (the layouts' localized names)
+    /// alongside the identifiers, so the Hammerspoon bridge can resolve
+    /// `hs.keycodes.setLayout`'s target from the payload it already
+    /// receives instead of a hard-coded identifier→name mapping.
+    private static func writeJSON(_ conversion: Conversion, core: LayoutConversionCore) {
+        let targetName = conversion.targetID == core.target.id ? core.target.name : core.source.name
+        let sourceName = conversion.sourceID == core.target.id ? core.target.name : core.source.name
+        let payload: [String: Any] = [
+            "text": conversion.text,
+            "sourceID": conversion.sourceID,
+            "targetID": conversion.targetID,
+            "sourceName": sourceName,
+            "targetName": targetName,
+        ]
         writeJSONObject(payload)
     }
 

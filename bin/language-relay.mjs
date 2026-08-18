@@ -36,9 +36,9 @@ console.log(`language relay 2.3
 
 commands:
   install                    build and install in ~/Applications
-  setup                      configure local prerequisites and print a checklist
+  setup                      enable the configured pair, wire the bridge, and print a checklist
   convert <text>             convert text and return JSON
-  switch                     switch U.S. ⇄ Russian–PC
+  switch                     switch between the configured pair
   status                     current input source as JSON
   doctor                     local health as JSON
   capabilities               stable capability schema as JSON`);
